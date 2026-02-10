@@ -1,7 +1,6 @@
 package mr
 
 import (
-	//"log"
 	"testing"
 	//"time"
 )
