@@ -36,8 +36,7 @@ type Coordinator struct {
 	// 使用哈希表利于指定完成task id的task的删除
 	assignedTasks map[int]Task
 
-	//
-	// TODO: 还有线程安全相关的锁没加
+	// 线程安全相关的锁等
 	mu   sync.Mutex
 	cond sync.Cond
 }
@@ -48,7 +47,7 @@ type Task struct {
 }
 
 // Your code here -- RPC handlers for the worker to call.
-// worker申请 map/reduce task的 RPC handler
+// worker申请 map/reduce task的 RPC 方法
 func (c *Coordinator) AskForTask(args *TaskArgs, reply *TaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -94,7 +93,7 @@ func (c *Coordinator) AskForTask(args *TaskArgs, reply *TaskReply) error {
 	return nil
 }
 
-// worker 报告当前task完成的 RPC handler
+// worker 报告当前task完成的 RPC 方法
 func (c *Coordinator) ReportTaskDone(args *ReportArgs, reply *ReportReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
