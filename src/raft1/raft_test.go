@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 // The tester generously allows solutions to complete elections in one second
@@ -87,6 +87,7 @@ func TestReElection3A(t *testing.T) {
 	// does not think it is the leader.
 	ts.checkNoLeader()
 
+	DPrintf("test phase")
 	// if a quorum arises, it should elect a leader.
 	ts.g.ConnectOne((leader2 + 1) % servers)
 	tester.AnnotateConnection(ts.g.GetConnected())
