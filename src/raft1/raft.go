@@ -40,6 +40,7 @@ type Raft struct {
 	lastApplied      int // 最后应用到状态机的log index. 与commitIndex之前的log为已提交但未应用到状态机的log
 	nextIndex        []int
 	matchIndex       []int
+	cond             sync.Cond
 }
 
 // log entry
@@ -209,10 +210,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.electionTimeouts = randomizedTimeouts()
 		reply.Term = rf.currentTerm
 		reply.Success = true
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+			rf.cond.Signal()
+		}
 		return
 	}
-	// TODO: 3B
 
+	// 3B
+	if len(rf.logs) <= args.PrevLogIndex || rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		rf.lastHeartbeat = time.Now()
+		rf.electionTimeouts = randomizedTimeouts()
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	// 如果rf.logs长度比leader还长，舍弃多余部分
+	if len(rf.logs) > len(args.Entries)+args.PrevLogIndex+1 {
+		diff := len(rf.logs) - len(args.Entries) - args.PrevLogIndex - 1
+		rf.logs = rf.logs[:len(rf.logs)-diff]
+	}
+	for i := 0; i < len(args.Entries); i++ {
+		logIndex := i + args.PrevLogIndex + 1
+		if logIndex < len(rf.logs) {
+			rf.logs[logIndex] = args.Entries[i]
+		} else {
+			rf.logs = append(rf.logs, args.Entries[i])
+		}
+	}
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.logs)-1)
+		rf.cond.Signal()
+	}
+	rf.lastHeartbeat = time.Now()
+	rf.electionTimeouts = randomizedTimeouts()
+	reply.Term = rf.currentTerm
+	reply.Success = true
+	DPrintf("%v replicates entries from %v in term %v, commitIndex:%v", rf.me, args.LeaderId, rf.currentTerm, rf.commitIndex)
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -280,52 +315,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.logs)
 	term = rf.currentTerm
 	rf.logs = append(rf.logs, LogEntry{command, index, term})
+	DPrintf("%v receives a new command to replicate in term %v", rf.me, rf.currentTerm)
 
 	// leader添加新日志后，发送AppendEntries RPC同步日志状态
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		reply := AppendEntriesReply{}
-		go func(i int) {
-			for {
-				// 若之前的rpc send线程中已变回follower，则其他线程无需继续发送rpc
-				rf.mu.Lock()
-				if !rf.isLeader {
-					rf.mu.Unlock()
-					return
-				}
-
-				// 由于可能进行多次nextIndex的递减，每次send rpc重新定义args
-				args := AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: rf.nextIndex[i] - 1,
-					PrevLogTerm:  rf.logs[rf.nextIndex[i]-1].Term,
-					Entries:      rf.logs[rf.nextIndex[i]:],
-					LeaderCommit: rf.commitIndex,
-				}
-				rf.mu.Unlock()
-
-				if rf.sendAppendEntries(i, &args, &reply) {
-					rf.mu.Lock()
-
-					if reply.Success {
-						rf.mu.Unlock()
-						return
-					} else if reply.Term > rf.currentTerm {
-						rf.becomeFollower(reply.Term)
-						isLeader = rf.isLeader
-						rf.mu.Unlock()
-						return
-					} else {
-						rf.nextIndex[i]--
-					}
-
-					rf.mu.Unlock()
-				}
-			}
-		}(i)
+		// 对每个server启动一个replicator线程进行日志复制
+		go rf.replicator(i)
 	}
 	return index, term, isLeader
 }
@@ -386,6 +384,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.logs = []LogEntry{{Index: 0, Term: 0}}
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.cond = *sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -398,6 +397,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	// applier goroutine
+	go rf.applier(applyCh)
 
 	return rf
 }
@@ -464,7 +465,7 @@ func (rf *Raft) startElection() {
 					rf.becomeLeader()
 					// 成为leader立即进行一次heartbeat broadcast
 					rf.heartbeatBroadcast()
-					DPrintf("%v become leader\n", rf.me)
+					DPrintf("%v becomes leader\n", rf.me)
 				}
 			}
 		}(i)
@@ -479,12 +480,10 @@ func (rf *Raft) heartbeatBroadcast() {
 	// 加锁会导致死锁
 	// 记住一点：只有在多个线程/goroutinue中运行的函数才要加锁，不然容易死锁
 	// rf.mu.Lock()
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-		// TODO:3B
-
-	}
+	// args := AppendEntriesArgs{
+	// 	Term:         rf.currentTerm,
+	// 	LeaderId:     rf.me,
+	// }
 	// rf.mu.Unlock()
 
 	for i := range rf.peers {
@@ -493,6 +492,11 @@ func (rf *Raft) heartbeatBroadcast() {
 		}
 
 		reply := AppendEntriesReply{}
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			LeaderCommit: rf.commitIndex,
+		}
 		go func(i int) {
 			// 如果在之前的rpc send线程中已经发现term大小问题，则无需继续heartbeat
 			rf.mu.Lock()
@@ -539,5 +543,113 @@ func (rf *Raft) reinitializeLeaderVolatileState() {
 	for i := range rf.peers {
 		rf.nextIndex[i] = len(rf.logs)
 		rf.matchIndex[i] = 0
+	}
+}
+
+// 只有leader设置日志为已提交，follower之后跟随提交
+func (rf *Raft) advanceCommitIndex() {
+	flag := false
+	if !rf.isLeader {
+		return
+	}
+	for N := rf.commitIndex + 1; N < len(rf.logs); N++ {
+		if rf.logs[N].Term != rf.currentTerm {
+			continue
+		}
+		cnt := 1
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			if rf.matchIndex[i] >= N {
+				cnt++
+			}
+		}
+		if cnt > len(rf.peers)/2 {
+			rf.commitIndex = N
+			flag = true
+		} else {
+			// 目前日志不满足，后面日志更不可能满足多数条件
+			break
+		}
+	}
+
+	if flag {
+		// 唤醒applier线程
+		rf.cond.Signal()
+	}
+}
+
+func (rf *Raft) replicator(server int) {
+	for {
+		// 若之前的rpc send线程中已变回follower，则其他线程无需继续发送rpc
+		rf.mu.Lock()
+		if !rf.isLeader {
+			rf.mu.Unlock()
+			return
+		}
+
+		// 由于可能进行多次nextIndex的递减，每次send rpc重新定义args
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: rf.nextIndex[server] - 1,
+			PrevLogTerm:  rf.logs[rf.nextIndex[server]-1].Term,
+			Entries:      rf.logs[rf.nextIndex[server]:],
+			LeaderCommit: rf.commitIndex,
+		}
+		rf.mu.Unlock()
+		reply := AppendEntriesReply{}
+
+		if rf.sendAppendEntries(server, &args, &reply) {
+			rf.mu.Lock()
+			DPrintf("%v sent a append entries rpc to %v in term %v", rf.me, server, rf.currentTerm)
+
+			if reply.Success {
+				// send rpc期间，系统状态是有可能变化的，此期间也没有加锁保护rf中共享变量，所以rf.logs等状态是可能变化的
+				// 这里应该用 matchIndx = prevLogIndex + len(entries[])
+				// rf.nextIndex[server] = len(rf.logs)
+				// rf.matchIndex[server] = len(rf.logs) - 1
+				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
+				rf.nextIndex[server] = rf.matchIndex[server] + 1
+
+				// 统计查看是否可以更新commitIndex
+				rf.advanceCommitIndex()
+				DPrintf("%v's commitIndex:%v", rf.me, rf.commitIndex)
+				rf.mu.Unlock()
+				return
+			} else if reply.Term > rf.currentTerm {
+				rf.becomeFollower(reply.Term)
+				rf.mu.Unlock()
+				return
+			} else {
+				rf.nextIndex[server]--
+			}
+
+			rf.mu.Unlock()
+		} else {
+			return
+		}
+	}
+}
+
+// 将日志应用到状态机的线程函数
+func (rf *Raft) applier(applyCh chan raftapi.ApplyMsg) {
+	for {
+		rf.mu.Lock()
+
+		for rf.commitIndex <= rf.lastApplied {
+			rf.cond.Wait()
+		}
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msg := raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[i].Command,
+				CommandIndex: i,
+			}
+			applyCh <- msg
+			rf.lastApplied = i
+		}
+		rf.mu.Unlock()
 	}
 }
